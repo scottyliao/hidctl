@@ -118,13 +118,18 @@ fn print_device(number: usize, device: &HidDevice) {
     match &device.info {
         Some(info) => {
             println!(
-                "[{number:>3}] {:04X}:{:04X}  rev {}.{:02}",
+                "[{number:>3}] {:04X}:{:04X}  rev {:X}.{:02X}",
                 info.vendor_id,
                 info.product_id,
-                // HidD_GetAttributes reports the version as one u16; the
-                // high byte is treated as the major version, the low byte
-                // as the minor version (the same convention Windows itself
-                // uses for USB bcdDevice-style version numbers).
+                // HidD_GetAttributes reports the version as one u16, which for
+                // USB devices is the device descriptor's `bcdDevice` field.
+                // That is binary-coded decimal: each nibble is one decimal
+                // digit, so 0x0114 means version 1.14 — NOT 1.20. Hence the
+                // hex formatting below, which reproduces the nibbles as
+                // written and matches the `REV_0114` that Windows itself puts
+                // in the device's hardware IDs. Vendors do occasionally store
+                // non-BCD values here; printing the nibbles verbatim at least
+                // keeps us consistent with what Windows reports.
                 info.version >> 8,
                 info.version & 0xFF,
             );
