@@ -1,11 +1,12 @@
 //! Safe wrappers around the SetupAPI / HID class driver calls in [`crate::win32`].
 //!
-//! The public surface of this module is just [`enumerate`] plus the two data
-//! types it produces ([`HidDevice`], [`HidInfo`]). Everything else here
-//! exists to turn the raw, unsafe, two-call-per-string Win32 idioms in
-//! [`crate::win32`] into ordinary owned Rust values (`String`, `Vec`, `Option`)
-//! with RAII cleanup, so [`crate::main`] never has to see a raw handle,
-//! pointer, or `unsafe` block.
+//! The public surface of this module is [`enumerate`] plus the data types it
+//! produces ([`HidDevice`], [`HidInfo`]), and [`EventStream`] for the `event`
+//! subcommand's raw-report reading. Everything else here exists to turn the
+//! raw, unsafe, two-call-per-string Win32 idioms in [`crate::win32`] into
+//! ordinary owned Rust values (`String`, `Vec`, `Option`) with RAII cleanup,
+//! so [`crate::main`] never has to see a raw handle, pointer, or `unsafe`
+//! block.
 
 use core::mem::{offset_of, size_of};
 use core::ptr;
@@ -185,6 +186,27 @@ impl Drop for DevInfoSet {
 struct File(HANDLE);
 
 impl File {
+    /// Shared `CreateFileW` call behind [`Self::open_for_query`] and
+    /// [`Self::open_for_read`] — the two only ever differ in
+    /// `dwDesiredAccess`.
+    fn open(path: &[u16], access: u32) -> Result<Self> {
+        let handle = unsafe {
+            CreateFileW(
+                path.as_ptr(),
+                access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(last_error("CreateFileW"));
+        }
+        Ok(Self(handle))
+    }
+
     /// Opens a device interface for querying only.
     ///
     /// `dwDesiredAccess` is deliberately 0: Windows keeps system keyboards and
@@ -198,27 +220,76 @@ impl File {
     /// security descriptor that blocks non-administrator opens outright,
     /// independent of the access mask requested. See [`HidDevice::open_error`].
     fn open_for_query(path: &[u16]) -> Result<Self> {
-        let handle = unsafe {
-            CreateFileW(
-                path.as_ptr(),
-                0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                ptr::null_mut(),
-                OPEN_EXISTING,
-                0,
-                ptr::null_mut(),
-            )
-        };
-        if handle == INVALID_HANDLE_VALUE {
-            return Err(last_error("CreateFileW"));
-        }
-        Ok(Self(handle))
+        Self::open(path, 0)
+    }
+
+    /// Opens a device interface for reading raw input reports via
+    /// [`ReadFile`] (see [`EventStream`]) — needs [`GENERIC_READ`], unlike
+    /// the zero-access open above which only ever feeds `HidD_*` metadata
+    /// calls.
+    fn open_for_read(path: &[u16]) -> Result<Self> {
+        Self::open(path, GENERIC_READ)
     }
 }
 
 impl Drop for File {
     fn drop(&mut self) {
         unsafe { CloseHandle(self.0) };
+    }
+}
+
+/// A HID device interface opened for reading raw input reports, as used by
+/// the `event` subcommand (`hidctl event --vid <id> --pid <id>`).
+///
+/// Reading needs an actual `GENERIC_READ` handle rather than the zero-access
+/// one [`enumerate`] uses for metadata — see [`File::open_for_read`].
+pub struct EventStream {
+    file: File,
+    /// Byte length of one `ReadFile` call's buffer. Taken from the matched
+    /// interface's `HidInfo::input_report_len` (`HIDP_CAPS::InputReportByteLength`),
+    /// which already accounts for the leading report-ID byte on devices that
+    /// number their reports — the buffer size `ReadFile` itself expects.
+    report_len: usize,
+}
+
+impl EventStream {
+    /// Opens `path` (a [`HidDevice::path`]) for reading, sizing every read
+    /// from `report_len` (a matched device's `HidInfo::input_report_len`).
+    pub fn open(path: &str, report_len: u16) -> Result<Self> {
+        // `CreateFileW` wants a NUL-terminated wide string, same as the
+        // metadata-query path in `describe`/`interface_detail`.
+        let mut wide: Vec<u16> = path.encode_utf16().collect();
+        wide.push(0);
+        Ok(Self {
+            file: File::open_for_read(&wide)?,
+            report_len: report_len as usize,
+        })
+    }
+
+    /// Blocks until the device emits one input report, then returns its raw
+    /// bytes (report ID first, if the device numbers its reports).
+    ///
+    /// No timeout, no polling: the handle was opened without
+    /// `FILE_FLAG_OVERLAPPED`, so `ReadFile` itself blocks the calling
+    /// thread until data arrives — which is exactly what the `event`
+    /// subcommand's infinite loop wants.
+    pub fn read_report(&self) -> Result<Vec<u8>> {
+        let mut buf = vec![0u8; self.report_len];
+        let mut read = 0u32;
+        let ok = unsafe {
+            ReadFile(
+                self.file.0,
+                buf.as_mut_ptr().cast(),
+                buf.len() as u32,
+                &mut read,
+                ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(last_error("ReadFile"));
+        }
+        buf.truncate(read as usize);
+        Ok(buf)
     }
 }
 

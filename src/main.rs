@@ -7,6 +7,11 @@
 //!
 //! By default each device gets a two-line summary (name plus interface
 //! count); `--detail` switches to a full per-interface dump instead.
+//!
+//! A separate `event` subcommand (`hidctl event --vid <id> --pid <id>`)
+//! switches from listing to streaming: it opens the one matching device's
+//! vendor-defined report channel ([`TARGET_USAGE_PAGE`]/[`TARGET_USAGE`]) and
+//! prints every raw input report it emits until interrupted with Ctrl+C.
 
 mod hid;
 mod usage;
@@ -21,7 +26,22 @@ use hid::HidDevice;
 const ASUS_VID: u16 = 0x0B05;
 
 const USAGE: &str = "usage: hidctl [--vid <id>] [--pid <id>] [asus] [--detail]\n\
-                     ids are decimal unless prefixed with 0x, e.g. 2821 or 0x0B05";
+                     ids are decimal unless prefixed with 0x, e.g. 2821 or 0x0B05\n\
+                     hidctl event --vid <id> --pid <id>   stream raw input reports";
+
+/// Usage message for the `event` subcommand specifically, shown instead of
+/// the top-level [`USAGE`] once we know that's the subcommand in play.
+const EVENT_USAGE: &str = "usage: hidctl event --vid <id> --pid <id>\n\
+                           ids are decimal unless prefixed with 0x, e.g. 2821 or 0x0B05";
+
+/// The vendor-defined usage page/usage that carries this device's raw event
+/// reports. A physical device can expose more than one vendor-defined
+/// channel (see [`is_vendor_defined_name`]); `hidctl event` narrows down to
+/// VID/PID first via `--vid`/`--pid`, then to the one interface matching
+/// this specific usage — the one observed emitting reports on the hardware
+/// this subcommand was built against.
+const TARGET_USAGE_PAGE: u16 = 0xFFC0;
+const TARGET_USAGE: u16 = 0x0001;
 
 /// Parsed command line.
 struct Args {
@@ -44,8 +64,34 @@ impl Args {
     }
 }
 
+/// Parsed command line for the `event` subcommand.
+///
+/// Unlike [`Args`], both fields are mandatory: a raw input report carries no
+/// VID/PID of its own, so the only way to know which device it came from is
+/// to have already chosen the device by its IDs before opening it.
+struct EventArgs {
+    vid: u16,
+    pid: u16,
+}
+
 fn main() -> ExitCode {
-    let args = match parse_args() {
+    // `event` is a subcommand, not a flag, so it's checked before the rest
+    // of the command line is handed to a parser — everything after it goes
+    // to `parse_event_args` instead, with its own rules (`--vid`/`--pid`
+    // mandatory, no `--detail`/`asus`).
+    let mut argv = std::env::args().skip(1).peekable();
+    if argv.peek().is_some_and(|arg| arg == "event") {
+        argv.next();
+        return match parse_event_args(argv) {
+            Ok(event_args) => run_event(event_args),
+            Err(msg) => {
+                eprintln!("hidctl: {msg}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    let args = match parse_args(argv) {
         Ok(args) => args,
         Err(msg) => {
             eprintln!("hidctl: {msg}");
@@ -147,14 +193,16 @@ fn main() -> ExitCode {
 /// Parses the command line into [`Args`].
 ///
 /// Deliberately minimal hand-rolled parsing (no argument-parsing crate) to
-/// match the rest of the project's no-dependencies approach.
-fn parse_args() -> Result<Args, String> {
+/// match the rest of the project's no-dependencies approach. Takes the
+/// already-collected argument iterator (rather than reading
+/// `std::env::args()` itself) so [`main`] can peek at the first token for
+/// the `event` subcommand before deciding whose parser gets the rest.
+fn parse_args(mut rest: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut args = Args {
         vid: None,
         pid: None,
         detail: false,
     };
-    let mut rest = std::env::args().skip(1);
 
     while let Some(arg) = rest.next() {
         match arg.as_str() {
@@ -176,6 +224,34 @@ fn parse_args() -> Result<Args, String> {
     }
 
     Ok(args)
+}
+
+/// Parses the command line for the `event` subcommand into [`EventArgs`].
+///
+/// Unlike [`parse_args`], `--vid` and `--pid` are both mandatory rather than
+/// optional filters — see [`EventArgs`] for why.
+fn parse_event_args(mut rest: impl Iterator<Item = String>) -> Result<EventArgs, String> {
+    let mut vid = None;
+    let mut pid = None;
+
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--vid" => vid = Some(parse_id(&take_value(&arg, &mut rest)?, "vendor")?),
+            "--pid" => pid = Some(parse_id(&take_value(&arg, &mut rest)?, "product")?),
+            other if other.starts_with("--vid=") => {
+                vid = Some(parse_id(inline_value(other), "vendor")?);
+            }
+            other if other.starts_with("--pid=") => {
+                pid = Some(parse_id(inline_value(other), "product")?);
+            }
+            other => return Err(format!("unexpected argument '{other}'\n{EVENT_USAGE}")),
+        }
+    }
+
+    Ok(EventArgs {
+        vid: vid.ok_or_else(|| format!("--vid is required\n{EVENT_USAGE}"))?,
+        pid: pid.ok_or_else(|| format!("--pid is required\n{EVENT_USAGE}"))?,
+    })
 }
 
 /// Pulls the value that follows a `--flag value` style argument.
@@ -424,6 +500,93 @@ fn print_device(number: usize, device: &HidDevice) {
         device.instance_id.as_ref().unwrap_or(&dash)
     );
     println!("      path         : {}", device.path);
+}
+
+/// Runs the `event` subcommand: finds the one device interface matching
+/// `args`' VID/PID and [`TARGET_USAGE_PAGE`]/[`TARGET_USAGE`], opens it for
+/// reading, and prints every raw input report it emits until the process is
+/// interrupted (Ctrl+C) or the read itself fails (e.g. the device is
+/// unplugged mid-stream).
+///
+/// There's no signal handling here: hitting Ctrl+C while [`hid::EventStream::read_report`]
+/// is blocked inside `ReadFile` still terminates the process immediately,
+/// since we never install our own console control handler — the OS default
+/// already does exactly what we want.
+fn run_event(args: EventArgs) -> ExitCode {
+    let devices = match hid::enumerate() {
+        Ok(devices) => devices,
+        Err(err) => {
+            eprintln!("hidctl: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // A physical device can expose more than one vendor-defined channel; of
+    // the interfaces matching VID/PID, only the one also matching this exact
+    // usage page/usage carries event reports. If more than one somehow
+    // matched all three, the first one found wins — the same kind of
+    // accepted trade-off `group_by_product` makes when collapsing by
+    // (VID, PID) alone.
+    let device = devices.iter().find(|device| {
+        device.info.as_ref().is_some_and(|info| {
+            info.vendor_id == args.vid
+                && info.product_id == args.pid
+                && info.usage_page == TARGET_USAGE_PAGE
+                && info.usage == TARGET_USAGE
+        })
+    });
+
+    let Some(device) = device else {
+        eprintln!(
+            "hidctl: no readable {}:{} interface exposing usage {}:{} was found",
+            hex_dec(args.vid),
+            hex_dec(args.pid),
+            hex_dec(TARGET_USAGE_PAGE),
+            hex_dec(TARGET_USAGE),
+        );
+        return ExitCode::FAILURE;
+    };
+    // `find` only matched devices with `info: Some(_)` above.
+    let info = device.info.as_ref().expect("matched via info above");
+
+    if info.input_report_len == 0 {
+        eprintln!("hidctl: matched interface declares no input reports to read");
+        return ExitCode::FAILURE;
+    }
+
+    let stream = match hid::EventStream::open(&device.path, info.input_report_len) {
+        Ok(stream) => stream,
+        Err(err) => {
+            eprintln!("hidctl: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!(
+        "listening on {} ({}:{}) — press Ctrl+C to stop\n",
+        device.device_desc.as_deref().unwrap_or("unknown device"),
+        hex_dec(args.vid),
+        hex_dec(args.pid),
+    );
+
+    loop {
+        match stream.read_report() {
+            Ok(report) => println!("{}", format_report(&report)),
+            Err(err) => {
+                eprintln!("hidctl: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+}
+
+/// Formats a raw report's bytes as space-separated hex, e.g. `01 3F 00 00`.
+fn format_report(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Formats a 16-bit identifier as hex plus decimal, e.g. `0x0B05 (2821)`.

@@ -86,6 +86,12 @@ pub const FILE_SHARE_WRITE: u32 = 0x0000_0002;
 /// object that the OS itself creates and destroys as hardware comes and goes.
 pub const OPEN_EXISTING: u32 = 3;
 
+/// `dwDesiredAccess` for opening a device handle we intend to call
+/// [`ReadFile`] on (the `event` subcommand). The zero-access open used
+/// elsewhere in this file for metadata-only queries is enough for the
+/// `HidD_*`/`HidP_*` calls, but not for actual I/O.
+pub const GENERIC_READ: u32 = 0x8000_0000;
+
 // ---------------------------------------------------------------------------
 // SetupDiGetClassDevsW flags
 // ---------------------------------------------------------------------------
@@ -325,6 +331,20 @@ unsafe extern "system" {
         dwFlagsAndAttributes: u32,
         hTemplateFile: HANDLE,
     ) -> HANDLE;
+
+    /// Reads one input report from an already-open HID device handle
+    /// (`hidctl event`; see [`crate::hid::EventStream::read_report`]).
+    /// `lpOverlapped` is always null here — the handle is opened without
+    /// `FILE_FLAG_OVERLAPPED`, so this blocks synchronously until the device
+    /// emits a report, which is exactly the behavior the subcommand's
+    /// infinite read loop wants.
+    pub fn ReadFile(
+        hFile: HANDLE,
+        lpBuffer: *mut c_void,
+        nNumberOfBytesToRead: u32,
+        lpNumberOfBytesRead: *mut u32,
+        lpOverlapped: *mut c_void,
+    ) -> BOOL;
 }
 
 // ---------------------------------------------------------------------------
