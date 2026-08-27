@@ -324,9 +324,8 @@ pub fn enumerate() -> Result<Vec<HidDevice>> {
     // sizing pattern in `interface_detail`/`instance_id`/`device_desc`).
     for index in 0.. {
         let mut iface = SP_DEVICE_INTERFACE_DATA::new();
-        if unsafe {
-            SetupDiEnumDeviceInterfaces(set.0, ptr::null_mut(), &class, index, &mut iface)
-        } == 0
+        if unsafe { SetupDiEnumDeviceInterfaces(set.0, ptr::null_mut(), &class, index, &mut iface) }
+            == 0
         {
             let err = last_error("SetupDiEnumDeviceInterfaces");
             if err.code == ERROR_NO_MORE_ITEMS {
@@ -362,7 +361,14 @@ fn interface_detail(
     let mut required: u32 = 0;
     // Expected to fail with ERROR_INSUFFICIENT_BUFFER; we only want the size.
     unsafe {
-        SetupDiGetDeviceInterfaceDetailW(set, iface, ptr::null_mut(), 0, &mut required, ptr::null_mut())
+        SetupDiGetDeviceInterfaceDetailW(
+            set,
+            iface,
+            ptr::null_mut(),
+            0,
+            &mut required,
+            ptr::null_mut(),
+        )
     };
     if required < SP_DEVICE_INTERFACE_DETAIL_DATA_W_CB_SIZE {
         return Err(last_error("SetupDiGetDeviceInterfaceDetailW"));
@@ -381,7 +387,14 @@ fn interface_detail(
 
     let mut devinfo = SP_DEVINFO_DATA::new();
     if unsafe {
-        SetupDiGetDeviceInterfaceDetailW(set, iface, detail, required, ptr::null_mut(), &mut devinfo)
+        SetupDiGetDeviceInterfaceDetailW(
+            set,
+            iface,
+            detail,
+            required,
+            ptr::null_mut(),
+            &mut devinfo,
+        )
     } == 0
     {
         return Err(last_error("SetupDiGetDeviceInterfaceDetailW"));

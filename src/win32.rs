@@ -233,7 +233,8 @@ pub struct SP_DEVICE_INTERFACE_DETAIL_DATA_W {
 /// different `size_of`. Passing the wrong constant here makes the call fail
 /// validation inside SetupAPI, so the value is hardcoded to match the SDK
 /// header rather than derived from Rust's own layout of the struct.
-pub const SP_DEVICE_INTERFACE_DETAIL_DATA_W_CB_SIZE: u32 = if size_of::<usize>() == 8 { 8 } else { 6 };
+pub const SP_DEVICE_INTERFACE_DETAIL_DATA_W_CB_SIZE: u32 =
+    if size_of::<usize>() == 8 { 8 } else { 6 };
 
 /// VID/PID/version for one opened HID device, as returned by
 /// `HidD_GetAttributes`. This is the cheapest way to get VID/PID — it needs
@@ -443,7 +444,8 @@ unsafe extern "system" {
     /// Reads VID/PID/version from an *opened* HID device handle. Requires no
     /// access rights beyond having successfully opened the handle at all
     /// (even with `dwDesiredAccess = 0`).
-    pub fn HidD_GetAttributes(HidDeviceObject: HANDLE, Attributes: *mut HIDD_ATTRIBUTES) -> BOOLEAN;
+    pub fn HidD_GetAttributes(HidDeviceObject: HANDLE, Attributes: *mut HIDD_ATTRIBUTES)
+    -> BOOLEAN;
 
     /// Reads the device's manufacturer string (from its USB/HID string
     /// descriptors, when it has one) as UTF-16 into `Buffer`. Fails (returns
@@ -490,5 +492,8 @@ unsafe extern "system" {
     /// fields we don't read) out of a preparsed report descriptor. Returns
     /// [`HIDP_STATUS_SUCCESS`] on success — any other `NTSTATUS` means
     /// `Capabilities` was not filled in.
-    pub fn HidP_GetCaps(PreparsedData: PHIDP_PREPARSED_DATA, Capabilities: *mut HIDP_CAPS) -> NTSTATUS;
+    pub fn HidP_GetCaps(
+        PreparsedData: PHIDP_PREPARSED_DATA,
+        Capabilities: *mut HIDP_CAPS,
+    ) -> NTSTATUS;
 }

@@ -68,8 +68,7 @@ fn main() -> ExitCode {
         // get matched instead of silently vanishing from a filter.
         devices.retain(|device| match device.vendor_product_id() {
             Some((vid, pid)) => {
-                args.vid.is_none_or(|want| want == vid)
-                    && args.pid.is_none_or(|want| want == pid)
+                args.vid.is_none_or(|want| want == vid) && args.pid.is_none_or(|want| want == pid)
             }
             // With no recoverable VID/PID there is no way to tell whether
             // this interface matches, so an explicit filter drops it.
@@ -82,14 +81,20 @@ fn main() -> ExitCode {
     // `group_by_product` below collapse them by simply walking the list —
     // then break ties on `path` for full determinism between runs.
     devices.sort_by(|a, b| {
-        let key = |d: &HidDevice| d.vendor_product_id().map(|(vid, pid)| {
-            // Devices we couldn't open have no usage page/usage (that comes
-            // from HidP_GetCaps, which needs an open handle) — default to
-            // (0, 0) so they still sort next to their siblings by VID/PID
-            // alone rather than being excluded from the ordering.
-            let usage = d.info.as_ref().map(|i| (i.usage_page, i.usage)).unwrap_or_default();
-            (vid, pid, usage)
-        });
+        let key = |d: &HidDevice| {
+            d.vendor_product_id().map(|(vid, pid)| {
+                // Devices we couldn't open have no usage page/usage (that comes
+                // from HidP_GetCaps, which needs an open handle) — default to
+                // (0, 0) so they still sort next to their siblings by VID/PID
+                // alone rather than being excluded from the ordering.
+                let usage = d
+                    .info
+                    .as_ref()
+                    .map(|i| (i.usage_page, i.usage))
+                    .unwrap_or_default();
+                (vid, pid, usage)
+            })
+        };
         key(a).cmp(&key(b)).then_with(|| a.path.cmp(&b.path))
     });
 
@@ -103,7 +108,11 @@ fn main() -> ExitCode {
     // "present" for the full unfiltered listing, "matched" once any filter is
     // in play, so the counts don't misleadingly imply they're the system-wide
     // totals.
-    let verb = if args.has_filter() { "matched" } else { "present" };
+    let verb = if args.has_filter() {
+        "matched"
+    } else {
+        "present"
+    };
     println!(
         "{} device(s), {} interface(s) {verb}.",
         groups.len(),
@@ -177,7 +186,9 @@ fn take_value(flag: &str, rest: &mut impl Iterator<Item = String>) -> Result<Str
 
 /// Splits the value out of a `--flag=value` style argument.
 fn inline_value(arg: &str) -> &str {
-    let (_, value) = arg.split_once('=').expect("caller checked for the '=' prefix");
+    let (_, value) = arg
+        .split_once('=')
+        .expect("caller checked for the '=' prefix");
     value
 }
 
@@ -192,7 +203,10 @@ fn inline_value(arg: &str) -> &str {
 ///
 /// `kind` only shapes the error message ("vendor" or "product").
 fn parse_id(value: &str, kind: &str) -> Result<u16, String> {
-    let parsed = match value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
+    let parsed = match value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
         Some(digits) => u16::from_str_radix(digits, 16),
         None => value.parse::<u16>(),
     };
@@ -245,7 +259,10 @@ fn print_group(key: Option<(u16, u16)>, interfaces: &[&HidDevice], pid_only: boo
     };
     let unreadable = interfaces.iter().filter(|d| d.info.is_none()).count();
     if unreadable > 0 {
-        println!("  {} {plural} ({unreadable} not readable)", interfaces.len());
+        println!(
+            "  {} {plural} ({unreadable} not readable)",
+            interfaces.len()
+        );
     } else {
         println!("  {} {plural}", interfaces.len());
     }
