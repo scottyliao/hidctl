@@ -6,11 +6,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `hidctl` is a Windows-only CLI that enumerates HID (Human Interface Device)
 interfaces present on the system, groups them back into physical devices, and
-prints a summary or a full per-interface dump. It talks to `setupapi.dll` and
-`hid.dll` directly via hand-written FFI — there is no `windows`/`winapi`
-dependency, and `Cargo.toml` has no dependencies at all. That "no external
-crates" choice is deliberate and should be preserved; if a task seems to call
-for one, prefer hand-rolling the extra bindings in `win32.rs` instead.
+prints a summary or a full per-interface dump. An `event` subcommand can also
+open one device's vendor-defined report channel and stream its raw input
+reports. It talks to `setupapi.dll`, `hid.dll`, and `kernel32.dll` directly
+via hand-written FFI — there is no `windows`/`winapi` dependency, and
+`Cargo.toml` has no dependencies at all. That "no external crates" choice is
+deliberate and should be preserved; if a task seems to call for one, prefer
+hand-rolling the extra bindings in `win32.rs` instead.
 
 ## Commands
 
@@ -21,6 +23,7 @@ cargo run                # list all present HID devices, grouped summary
 cargo run -- --detail    # full per-interface dump
 cargo run -- asus        # shorthand for --vid 0x0B05
 cargo run -- --vid 0x0B05 --pid 0x1A92
+cargo run -- event --vid 0x0B05 --pid 0x1AB3   # stream raw input reports (Ctrl+C stops)
 cargo check               # fast type-check without codegen
 cargo clippy              # lint (if clippy component is installed)
 ```
@@ -38,6 +41,11 @@ bug to fix.
 
 Builds only make sense on Windows (MSVC or GNU toolchain); `win32.rs` links
 directly against `setupapi` and `hid` via `#[link(name = "...")]`.
+
+## Git
+
+Commit directly to `main`; do not create a working branch first (per the
+repo owner's explicit preference).
 
 ## Architecture
 
@@ -62,11 +70,15 @@ tracing a change:
   `HidD_GetPreparsedData` → `HidP_GetCaps`) into ordinary owned Rust values.
   RAII wrappers (`DevInfoSet`, `File`, `PreparsedData`) guarantee the matching
   `SetupDiDestroyDeviceInfoList` / `CloseHandle` / `HidD_FreePreparsedData`
-  cleanup call runs exactly once. Its only public surface is
+  cleanup call runs exactly once. Its public surface is
   `enumerate() -> Result<Vec<HidDevice>>` plus the `HidDevice`/`HidInfo`
-  types. A device that fails to open (commonly `ERROR_ACCESS_DENIED` on
-  locked system keyboard/mouse collections) is still returned, with `info:
-  None` and `open_error` set, rather than being dropped from the list.
+  types, and `EventStream` — a blocking `ReadFile` wrapper for the `event`
+  subcommand, which opens with `GENERIC_READ` (unlike the zero-access open
+  `enumerate` uses for metadata, chosen so system keyboards/mice held
+  exclusively still answer `HidD_*` queries). A device that fails to open
+  (commonly `ERROR_ACCESS_DENIED` on locked system keyboard/mouse
+  collections) is still returned, with `info: None` and `open_error` set,
+  rather than being dropped from the list.
 
 - **`usage.rs`** — static lookup tables mapping HID usage page/usage numbers
   to human-readable names (e.g. `0x01:0x06` → "Generic Desktop / Keyboard").
@@ -77,7 +89,13 @@ tracing a change:
   crate — matches the project's zero-dependency stance), calls
   `hid::enumerate`, filters by `--vid`/`--pid` (or the `asus` shorthand for
   `--vid 0x0B05`), sorts, then collapses the flat interface list into
-  per-physical-device groups via `group_by_product`.
+  per-physical-device groups via `group_by_product`. The `event` subcommand
+  is dispatched before the listing parser runs and has its own parser with
+  different rules: `--vid`/`--pid` are *mandatory* there (a raw report
+  carries no VID/PID, so the device must be chosen before opening), and the
+  interface to read is the one also matching the hardcoded vendor-defined
+  usage `TARGET_USAGE_PAGE:TARGET_USAGE` (`0xFFC0:0x0001`). The read loop
+  relies on the OS default Ctrl+C handling — no console handler is installed.
 
 ### Key data-flow detail: interfaces vs. devices
 
