@@ -1,17 +1,17 @@
 //! Lists the HID devices present on the system, grouped by physical device.
 //!
 //! Everything Windows-specific lives in [`win32`] (raw FFI) and [`hid`] (safe
-//! wrappers) — this file is just the CLI: parse arguments, call
-//! [`hid::enumerate`], optionally filter by vendor and/or product ID, sort,
-//! group interfaces back into the physical devices they belong to, and print.
+//! wrappers) — this file is just the CLI, organized as subcommands (bare
+//! `hidctl` prints the usage and asks for one):
 //!
-//! By default each device gets a two-line summary (name plus interface
-//! count); `--detail` switches to a full per-interface dump instead.
-//!
-//! A separate `event` subcommand (`hidctl event --vid <id> --pid <id>`)
-//! switches from listing to streaming: it opens the one matching device's
-//! vendor-defined report channel ([`TARGET_USAGE_PAGE`]/[`TARGET_USAGE`]) and
-//! prints every raw input report it emits until interrupted with Ctrl+C.
+//! - `list` — call [`hid::enumerate`], optionally filter by vendor and/or
+//!   product ID, sort, group interfaces back into the physical devices they
+//!   belong to, and print. Each device gets a two-line summary (name plus
+//!   interface count); `--detail` switches to a full per-interface dump.
+//! - `event` (`hidctl event --vid <id> --pid <id>`) — streaming instead of
+//!   listing: opens the one matching device's vendor-defined report channel
+//!   ([`TARGET_USAGE_PAGE`]/[`TARGET_USAGE`]) and prints every raw input
+//!   report it emits until interrupted with Ctrl+C.
 
 mod hid;
 mod usage;
@@ -25,9 +25,20 @@ use hid::HidDevice;
 /// `--vid 0x0B05` without having to remember/type the value.
 const ASUS_VID: u16 = 0x0B05;
 
-const USAGE: &str = "usage: hidctl [--vid <id>] [--pid <id>] [asus] [--detail]\n\
-                     ids are decimal unless prefixed with 0x, e.g. 2821 or 0x0B05\n\
-                     hidctl event --vid <id> --pid <id>   stream raw input reports";
+/// Top-level usage: the subcommand menu, shown for bare `hidctl` and for an
+/// unrecognized subcommand.
+const USAGE: &str = "usage: hidctl <command> [options]\n\
+                     \n\
+                     commands:\n\
+                     \x20 list  [--vid <id>] [--pid <id>] [asus] [--detail]   list HID device interfaces\n\
+                     \x20 event  --vid <id>   --pid <id>                      stream raw input reports\n\
+                     \n\
+                     ids are decimal unless prefixed with 0x, e.g. 2821 or 0x0B05";
+
+/// Usage message for the `list` subcommand specifically, shown instead of
+/// the top-level [`USAGE`] once we know that's the subcommand in play.
+const LIST_USAGE: &str = "usage: hidctl list [--vid <id>] [--pid <id>] [asus] [--detail]\n\
+                          ids are decimal unless prefixed with 0x, e.g. 2821 or 0x0B05";
 
 /// Usage message for the `event` subcommand specifically, shown instead of
 /// the top-level [`USAGE`] once we know that's the subcommand in play.
@@ -75,30 +86,27 @@ struct EventArgs {
 }
 
 fn main() -> ExitCode {
-    // `event` is a subcommand, not a flag, so it's checked before the rest
-    // of the command line is handed to a parser — everything after it goes
-    // to `parse_event_args` instead, with its own rules (`--vid`/`--pid`
-    // mandatory, no `--detail`/`asus`).
-    let mut argv = std::env::args().skip(1).peekable();
-    if argv.peek().is_some_and(|arg| arg == "event") {
-        argv.next();
-        return match parse_event_args(argv) {
-            Ok(event_args) => run_event(event_args),
-            Err(msg) => {
-                eprintln!("hidctl: {msg}");
-                ExitCode::FAILURE
-            }
-        };
-    }
-
-    let args = match parse_args(argv) {
-        Ok(args) => args,
-        Err(msg) => {
-            eprintln!("hidctl: {msg}");
-            return ExitCode::FAILURE;
-        }
+    // Subcommand dispatch: the first token picks which parser gets the rest
+    // of the command line, since each subcommand has its own rules (`list`
+    // takes optional filters plus `--detail`/`asus`; `event` requires both
+    // IDs and accepts nothing else). Bare `hidctl` deliberately does
+    // nothing but ask for a subcommand rather than defaulting to `list`, so
+    // the listing never runs by accident.
+    let mut argv = std::env::args().skip(1);
+    let result = match argv.next().as_deref() {
+        Some("list") => parse_list_args(argv).map(run_list),
+        Some("event") => parse_event_args(argv).map(run_event),
+        Some(other) => Err(format!("unknown command '{other}'\n{USAGE}")),
+        None => Err(format!("a command is required\n{USAGE}")),
     };
+    result.unwrap_or_else(|msg| {
+        eprintln!("hidctl: {msg}");
+        ExitCode::FAILURE
+    })
+}
 
+/// Runs the `list` subcommand: enumerate, filter, sort, group, print.
+fn run_list(args: Args) -> ExitCode {
     let mut devices = match hid::enumerate() {
         Ok(devices) => devices,
         Err(err) => {
@@ -190,14 +198,13 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Parses the command line into [`Args`].
+/// Parses the `list` subcommand's arguments into [`Args`].
 ///
 /// Deliberately minimal hand-rolled parsing (no argument-parsing crate) to
 /// match the rest of the project's no-dependencies approach. Takes the
-/// already-collected argument iterator (rather than reading
-/// `std::env::args()` itself) so [`main`] can peek at the first token for
-/// the `event` subcommand before deciding whose parser gets the rest.
-fn parse_args(mut rest: impl Iterator<Item = String>) -> Result<Args, String> {
+/// argument iterator with the subcommand token already consumed by
+/// [`main`]'s dispatch.
+fn parse_list_args(mut rest: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut args = Args {
         vid: None,
         pid: None,
@@ -208,8 +215,12 @@ fn parse_args(mut rest: impl Iterator<Item = String>) -> Result<Args, String> {
         match arg.as_str() {
             "--detail" | "-d" => args.detail = true,
             // ID given as a separate argument: `--vid 0x0B05`.
-            "--vid" => args.vid = Some(parse_id(&take_value(&arg, &mut rest)?, "vendor")?),
-            "--pid" => args.pid = Some(parse_id(&take_value(&arg, &mut rest)?, "product")?),
+            "--vid" => {
+                args.vid = Some(parse_id(&take_value(&arg, &mut rest, LIST_USAGE)?, "vendor")?);
+            }
+            "--pid" => {
+                args.pid = Some(parse_id(&take_value(&arg, &mut rest, LIST_USAGE)?, "product")?);
+            }
             // ID given inline: `--vid=0x0B05`.
             other if other.starts_with("--vid=") => {
                 args.vid = Some(parse_id(inline_value(other), "vendor")?);
@@ -219,7 +230,7 @@ fn parse_args(mut rest: impl Iterator<Item = String>) -> Result<Args, String> {
             }
             // Convenience alias for the vendor this tool was built against.
             other if other.eq_ignore_ascii_case("asus") => args.vid = Some(ASUS_VID),
-            other => return Err(format!("unexpected argument '{other}'\n{USAGE}")),
+            other => return Err(format!("unexpected argument '{other}'\n{LIST_USAGE}")),
         }
     }
 
@@ -236,8 +247,8 @@ fn parse_event_args(mut rest: impl Iterator<Item = String>) -> Result<EventArgs,
 
     while let Some(arg) = rest.next() {
         match arg.as_str() {
-            "--vid" => vid = Some(parse_id(&take_value(&arg, &mut rest)?, "vendor")?),
-            "--pid" => pid = Some(parse_id(&take_value(&arg, &mut rest)?, "product")?),
+            "--vid" => vid = Some(parse_id(&take_value(&arg, &mut rest, EVENT_USAGE)?, "vendor")?),
+            "--pid" => pid = Some(parse_id(&take_value(&arg, &mut rest, EVENT_USAGE)?, "product")?),
             other if other.starts_with("--vid=") => {
                 vid = Some(parse_id(inline_value(other), "vendor")?);
             }
@@ -254,10 +265,15 @@ fn parse_event_args(mut rest: impl Iterator<Item = String>) -> Result<EventArgs,
     })
 }
 
-/// Pulls the value that follows a `--flag value` style argument.
-fn take_value(flag: &str, rest: &mut impl Iterator<Item = String>) -> Result<String, String> {
+/// Pulls the value that follows a `--flag value` style argument. `usage` is
+/// the calling subcommand's usage text, appended to the error message.
+fn take_value(
+    flag: &str,
+    rest: &mut impl Iterator<Item = String>,
+    usage: &str,
+) -> Result<String, String> {
     rest.next()
-        .ok_or_else(|| format!("{flag} needs a hex id\n{USAGE}"))
+        .ok_or_else(|| format!("{flag} needs a hex id\n{usage}"))
 }
 
 /// Splits the value out of a `--flag=value` style argument.

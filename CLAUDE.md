@@ -19,20 +19,23 @@ hand-rolling the extra bindings in `win32.rs` instead.
 ```
 cargo build              # debug build
 cargo build --release    # release build
-cargo run                # list all present HID devices, grouped summary
-cargo run -- --detail    # full per-interface dump
-cargo run -- asus        # shorthand for --vid 0x0B05
-cargo run -- --vid 0x0B05 --pid 0x1A92
+cargo run -- list                # all present HID devices, grouped summary
+cargo run -- list --detail       # full per-interface dump
+cargo run -- list asus           # shorthand for --vid 0x0B05
+cargo run -- list --vid 0x0B05 --pid 0x1A92
 cargo run -- event --vid 0x0B05 --pid 0x1AB3   # stream raw input reports (Ctrl+C stops)
 cargo check               # fast type-check without codegen
 cargo clippy              # lint (if clippy component is installed)
 ```
 
+The CLI is subcommand-only: bare `hidctl` prints the command menu and exits
+with failure rather than defaulting to `list`.
+
 There is no test suite (`cargo test` has nothing to run) — this code is a
 thin, mostly-`unsafe` wrapper around live Win32 device state, so it's
 exercised by running it against real hardware rather than unit tests. When
-verifying a change, prefer `cargo run -- --detail` (and comparing against
-Device Manager) over trying to add tests around the FFI layer.
+verifying a change, prefer `cargo run -- list --detail` (and comparing
+against Device Manager) over trying to add tests around the FFI layer.
 
 Note some HID collections (notably the OS's primary keyboard/mouse) return
 `ERROR_ACCESS_DENIED` unless the process is elevated — that's expected
