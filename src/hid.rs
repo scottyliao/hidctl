@@ -103,6 +103,17 @@ pub struct HidDevice {
     /// The registry `SPDRP_DEVICEDESC` string — Device Manager's display
     /// name for the underlying device node (e.g. "ROG STRIX SCOPE II").
     pub device_desc: Option<String>,
+    /// The physical device's hardware serial number, recovered by walking up
+    /// the device tree to its USB node — see [`ancestor_serial`].
+    ///
+    /// Distinct from `HidInfo::serial_number`, which is the HID *string
+    /// descriptor* read off an open handle: plenty of devices leave that one
+    /// empty while still reporting a USB `iSerialNumber`, so this is often
+    /// the only serial available. It also survives a failed open, since it
+    /// comes from the device tree rather than from the device itself — which
+    /// makes it the one field that can tell two identical units apart even
+    /// when both are access-denied.
+    pub serial: Option<String>,
     /// `None` when the interface could not be opened; `open_error` says why.
     pub info: Option<HidInfo>,
     /// The `GetLastError()` code from the failed `CreateFileW`/`HidD_GetAttributes`
@@ -512,6 +523,74 @@ fn instance_id(set: HDEVINFO, devinfo: &mut SP_DEVINFO_DATA) -> Option<String> {
     Some(from_wide(&buf))
 }
 
+/// Reads one devnode's instance ID by [`DEVINST`] rather than by
+/// `SP_DEVINFO_DATA`.
+///
+/// [`MAX_DEVICE_ID_LEN`] is the PnP manager's own hard cap on instance ID
+/// length, so unlike the SetupAPI getters in this file this needs no
+/// ask-twice sizing probe — one fixed buffer is always big enough.
+fn device_id(devinst: DEVINST) -> Option<String> {
+    let mut buf = [0u16; MAX_DEVICE_ID_LEN];
+    let status = unsafe { CM_Get_Device_IDW(devinst, buf.as_mut_ptr(), buf.len() as u32, 0) };
+    if status != CR_SUCCESS {
+        return None;
+    }
+    Some(from_wide(&buf))
+}
+
+/// Walks up the device tree from `devinst` looking for an ancestor USB node
+/// whose instance ID carries a hardware serial number.
+///
+/// The serial is not on the HID node itself. A composite USB device nests
+/// three levels deep, and only the topmost node is named after the serial:
+///
+/// ```text
+/// USB\VID_0B05&PID_1ACE\T4MPGDD010NS                  <- serial lives here
+///  \_ USB\VID_0B05&PID_1ACE&MI_03\6&2d541307&0&0003   <- one USB interface
+///      \_ HID\VID_0B05&PID_1ACE&MI_03&COL04\7&24DD...  <- what we enumerate
+/// ```
+///
+/// So this climbs parents until it finds one that looks like a serial-named
+/// USB node (see [`serial_from_instance_id`]). The iteration cap is only a
+/// termination guard — the real walk is 2-3 levels and normally ends when
+/// `CM_Get_Parent` fails at the tree root.
+fn ancestor_serial(devinst: DEVINST) -> Option<String> {
+    let mut current = devinst;
+    for _ in 0..8 {
+        let mut parent: DEVINST = 0;
+        if unsafe { CM_Get_Parent(&mut parent, current, 0) } != CR_SUCCESS {
+            return None;
+        }
+        let id = device_id(parent)?;
+        if let Some(serial) = serial_from_instance_id(&id) {
+            return Some(serial.to_string());
+        }
+        current = parent;
+    }
+    None
+}
+
+/// Extracts the serial number out of a USB devnode's instance ID, if it has
+/// one: `USB\VID_0B05&PID_1ACE\T4MPGDD010NS` -> `T4MPGDD010NS`.
+///
+/// Windows uses the device's USB `iSerialNumber` verbatim as the final
+/// instance-ID segment when the device reports one, and synthesizes a
+/// location-derived id (`6&2cc52d1f&0&1` — a hash of the parent's path plus
+/// hub/port numbers) when it does not. The synthesized form always contains
+/// `&` and a real serial never does, which is what lets them be told apart
+/// here — important because the synthesized kind is *not* a stable device
+/// identity: it changes when the device moves to another port.
+///
+/// The `USB\` prefix check keeps intermediate `&MI_xx` nodes out; their final
+/// segment is always a synthesized one anyway, so this is belt-and-braces.
+fn serial_from_instance_id(id: &str) -> Option<&str> {
+    let last = id.strip_prefix("USB\\")?.rsplit('\\').next()?;
+    if last.is_empty() || last.contains('&') {
+        return None;
+    }
+    Some(last)
+}
+
 /// Reads `SPDRP_DEVICEDESC`, the name Device Manager shows.
 ///
 /// Same ask-twice sizing pattern again, but this API reports `required` in
@@ -561,6 +640,8 @@ fn device_desc(set: HDEVINFO, devinfo: &mut SP_DEVINFO_DATA) -> Option<String> {
 ///    available, since it comes from the device information set itself and
 ///    never requires opening the device.
 /// 2. HID metadata (`info`) — requires successfully opening the interface
+///    (`serial` belongs to group 1: it comes from the device tree, not the
+///    device, so it survives a failed open)
 ///    with [`File::open_for_query`] first. When that fails (most commonly
 ///    `ERROR_ACCESS_DENIED` on the OS's primary keyboard/mouse collections),
 ///    we still return a [`HidDevice`] with everything from step 1 and
@@ -571,6 +652,9 @@ fn describe(path: &[u16], set: HDEVINFO, devinfo: &mut SP_DEVINFO_DATA) -> HidDe
         path: from_wide(path),
         instance_id: instance_id(set, devinfo),
         device_desc: device_desc(set, devinfo),
+        // Device-tree walk, so this works even for the interfaces that fail
+        // to open below — see the field's doc comment.
+        serial: ancestor_serial(devinfo.DevInst),
         info: None,
         open_error: None,
     };

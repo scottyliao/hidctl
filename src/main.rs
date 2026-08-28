@@ -29,21 +29,23 @@ const ASUS_VID: u16 = 0x0B05;
 /// unrecognized subcommand.
 const USAGE: &str = "usage: hidctl <command> [options]\n\
                      \n\
-                     commands:\n\
-                     \x20 list  [--vid <id>] [--pid <id>] [asus] [--detail]   list HID device interfaces\n\
-                     \x20 event  --vid <id>   --pid <id>                      stream raw input reports\n\
+                     available commands:\n\
+                     \x20  list [--vid <id>] [--pid <id>] [-d | --detail]   list HID device interfaces\n\
+                     \x20  event --vid <id> --pid <id>                 stream raw input reports\n\
                      \n\
                      ids are decimal unless prefixed with 0x, e.g. 2821 or 0x0B05";
 
 /// Usage message for the `list` subcommand specifically, shown instead of
 /// the top-level [`USAGE`] once we know that's the subcommand in play.
-const LIST_USAGE: &str = "usage: hidctl list [--vid <id>] [--pid <id>] [asus] [--detail]\n\
+const LIST_USAGE: &str = "usage: hidctl list [--vid <id>] [--pid <id>] [-d | --detail]\n\
                           ids are decimal unless prefixed with 0x, e.g. 2821 or 0x0B05";
 
 /// Usage message for the `event` subcommand specifically, shown instead of
 /// the top-level [`USAGE`] once we know that's the subcommand in play.
-const EVENT_USAGE: &str = "usage: hidctl event --vid <id> --pid <id>\n\
-                           ids are decimal unless prefixed with 0x, e.g. 2821 or 0x0B05";
+const EVENT_USAGE: &str = "usage: hidctl event --vid <id> --pid <id> [--serial <s>]\n\
+                           ids are decimal unless prefixed with 0x, e.g. 2821 or 0x0B05\n\
+                           --serial picks between several identical units; \
+                           run 'hidctl list --detail' to see the values";
 
 /// The vendor-defined usage page/usage that carries this device's raw event
 /// reports. A physical device can expose more than one vendor-defined
@@ -77,12 +79,16 @@ impl Args {
 
 /// Parsed command line for the `event` subcommand.
 ///
-/// Unlike [`Args`], both fields are mandatory: a raw input report carries no
+/// Unlike [`Args`], `vid`/`pid` are mandatory: a raw input report carries no
 /// VID/PID of its own, so the only way to know which device it came from is
 /// to have already chosen the device by its IDs before opening it.
 struct EventArgs {
     vid: u16,
     pid: u16,
+    /// Which physical unit to read, when VID/PID alone match more than one
+    /// (two identical dongles, say). `None` is only valid when exactly one
+    /// interface matches — [`run_event`] refuses to guess otherwise.
+    serial: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -216,10 +222,16 @@ fn parse_list_args(mut rest: impl Iterator<Item = String>) -> Result<Args, Strin
             "--detail" | "-d" => args.detail = true,
             // ID given as a separate argument: `--vid 0x0B05`.
             "--vid" => {
-                args.vid = Some(parse_id(&take_value(&arg, &mut rest, LIST_USAGE)?, "vendor")?);
+                args.vid = Some(parse_id(
+                    &take_value(&arg, &mut rest, LIST_USAGE)?,
+                    "vendor",
+                )?);
             }
             "--pid" => {
-                args.pid = Some(parse_id(&take_value(&arg, &mut rest, LIST_USAGE)?, "product")?);
+                args.pid = Some(parse_id(
+                    &take_value(&arg, &mut rest, LIST_USAGE)?,
+                    "product",
+                )?);
             }
             // ID given inline: `--vid=0x0B05`.
             other if other.starts_with("--vid=") => {
@@ -244,16 +256,33 @@ fn parse_list_args(mut rest: impl Iterator<Item = String>) -> Result<Args, Strin
 fn parse_event_args(mut rest: impl Iterator<Item = String>) -> Result<EventArgs, String> {
     let mut vid = None;
     let mut pid = None;
+    let mut serial = None;
 
     while let Some(arg) = rest.next() {
         match arg.as_str() {
-            "--vid" => vid = Some(parse_id(&take_value(&arg, &mut rest, EVENT_USAGE)?, "vendor")?),
-            "--pid" => pid = Some(parse_id(&take_value(&arg, &mut rest, EVENT_USAGE)?, "product")?),
+            "--vid" => {
+                vid = Some(parse_id(
+                    &take_value(&arg, &mut rest, EVENT_USAGE)?,
+                    "vendor",
+                )?)
+            }
+            "--pid" => {
+                pid = Some(parse_id(
+                    &take_value(&arg, &mut rest, EVENT_USAGE)?,
+                    "product",
+                )?)
+            }
+            // Serials are opaque vendor strings, not numbers, so unlike the
+            // IDs this is taken verbatim with no parsing.
+            "--serial" => serial = Some(take_value(&arg, &mut rest, EVENT_USAGE)?),
             other if other.starts_with("--vid=") => {
                 vid = Some(parse_id(inline_value(other), "vendor")?);
             }
             other if other.starts_with("--pid=") => {
                 pid = Some(parse_id(inline_value(other), "product")?);
+            }
+            other if other.starts_with("--serial=") => {
+                serial = Some(inline_value(other).to_string());
             }
             other => return Err(format!("unexpected argument '{other}'\n{EVENT_USAGE}")),
         }
@@ -262,6 +291,7 @@ fn parse_event_args(mut rest: impl Iterator<Item = String>) -> Result<EventArgs,
     Ok(EventArgs {
         vid: vid.ok_or_else(|| format!("--vid is required\n{EVENT_USAGE}"))?,
         pid: pid.ok_or_else(|| format!("--pid is required\n{EVENT_USAGE}"))?,
+        serial,
     })
 }
 
@@ -468,7 +498,7 @@ fn print_device(number: usize, device: &HidDevice) {
                 info.manufacturer.as_ref().unwrap_or(&dash)
             );
             println!(
-                "      serial       : {}",
+                "      hid serial   : {}",
                 info.serial_number.as_ref().unwrap_or(&dash)
             );
             // Look up a friendly name for this collection's usage page/usage
@@ -511,6 +541,15 @@ fn print_device(number: usize, device: &HidDevice) {
         "      device desc  : {}",
         device.device_desc.as_ref().unwrap_or(&dash)
     );
+    // The physical unit's serial (device-tree sourced, so present even for
+    // the interfaces above that couldn't be opened) — this is the value to
+    // pass to `hidctl event --serial` when several identical units are
+    // attached. Labelled "unit" to distinguish it from the HID string
+    // descriptor printed as "hid serial" above.
+    println!(
+        "      unit serial  : {}",
+        device.serial.as_ref().unwrap_or(&dash)
+    );
     println!(
         "      instance id  : {}",
         device.instance_id.as_ref().unwrap_or(&dash)
@@ -519,10 +558,17 @@ fn print_device(number: usize, device: &HidDevice) {
 }
 
 /// Runs the `event` subcommand: finds the one device interface matching
-/// `args`' VID/PID and [`TARGET_USAGE_PAGE`]/[`TARGET_USAGE`], opens it for
-/// reading, and prints every raw input report it emits until the process is
-/// interrupted (Ctrl+C) or the read itself fails (e.g. the device is
-/// unplugged mid-stream).
+/// `args`' VID/PID (and `--serial`, when given) plus
+/// [`TARGET_USAGE_PAGE`]/[`TARGET_USAGE`], opens it for reading, and prints
+/// every raw input report it emits until the process is interrupted (Ctrl+C)
+/// or the read itself fails (e.g. the device is unplugged mid-stream).
+///
+/// Refuses to run when more than one interface matches — two identical
+/// dongles share a VID/PID, and silently streaming from an arbitrary one of
+/// them would be a correctness bug, not a cosmetic one (unlike
+/// [`group_by_product`] merging identical units in a *listing*, which is
+/// only a display trade-off). The error lists each candidate's serial so it
+/// can be re-run with `--serial`.
 ///
 /// There's no signal handling here: hitting Ctrl+C while [`hid::EventStream::read_report`]
 /// is blocked inside `ReadFile` still terminates the process immediately,
@@ -539,30 +585,69 @@ fn run_event(args: EventArgs) -> ExitCode {
 
     // A physical device can expose more than one vendor-defined channel; of
     // the interfaces matching VID/PID, only the one also matching this exact
-    // usage page/usage carries event reports. If more than one somehow
-    // matched all three, the first one found wins — the same kind of
-    // accepted trade-off `group_by_product` makes when collapsing by
-    // (VID, PID) alone.
-    let device = devices.iter().find(|device| {
-        device.info.as_ref().is_some_and(|info| {
-            info.vendor_id == args.vid
-                && info.product_id == args.pid
-                && info.usage_page == TARGET_USAGE_PAGE
-                && info.usage == TARGET_USAGE
+    // usage page/usage carries event reports. Every match is collected (not
+    // just the first) so an ambiguous request can be reported rather than
+    // resolved by luck of enumeration order, which SetupAPI does not promise
+    // to keep stable across replugs or reboots.
+    let mut matches: Vec<&HidDevice> = devices
+        .iter()
+        .filter(|device| {
+            device.info.as_ref().is_some_and(|info| {
+                info.vendor_id == args.vid
+                    && info.product_id == args.pid
+                    && info.usage_page == TARGET_USAGE_PAGE
+                    && info.usage == TARGET_USAGE
+            })
         })
-    });
+        .filter(|device| match &args.serial {
+            // An explicit --serial must match the unit exactly. Interfaces
+            // with no recoverable serial can never satisfy it.
+            Some(want) => device.serial.as_deref() == Some(want.as_str()),
+            None => true,
+        })
+        .collect();
+    // Enumeration order is not guaranteed stable, so impose one of our own
+    // before anything below reports or picks from this list.
+    matches.sort_by(|a, b| a.serial.cmp(&b.serial).then_with(|| a.path.cmp(&b.path)));
 
-    let Some(device) = device else {
-        eprintln!(
-            "hidctl: no readable {}:{} interface exposing usage {}:{} was found",
-            hex_dec(args.vid),
-            hex_dec(args.pid),
-            hex_dec(TARGET_USAGE_PAGE),
-            hex_dec(TARGET_USAGE),
-        );
-        return ExitCode::FAILURE;
+    let device = match matches.as_slice() {
+        [one] => *one,
+        [] => {
+            let qualifier = match &args.serial {
+                Some(serial) => format!(" with serial '{serial}'"),
+                None => String::new(),
+            };
+            eprintln!(
+                "hidctl: no readable {}:{} interface{qualifier} exposing usage {}:{} was found",
+                hex_dec(args.vid),
+                hex_dec(args.pid),
+                hex_dec(TARGET_USAGE_PAGE),
+                hex_dec(TARGET_USAGE),
+            );
+            return ExitCode::FAILURE;
+        }
+        several => {
+            eprintln!(
+                "hidctl: {} interfaces match {}:{} usage {}:{} — refusing to guess",
+                several.len(),
+                hex_dec(args.vid),
+                hex_dec(args.pid),
+                hex_dec(TARGET_USAGE_PAGE),
+                hex_dec(TARGET_USAGE),
+            );
+            for candidate in several {
+                match &candidate.serial {
+                    Some(serial) => eprintln!("  --serial {serial}"),
+                    // Nothing to offer as a selector for this one; showing
+                    // the path at least identifies which candidate it is.
+                    None => eprintln!("  (no serial available) {}", candidate.path),
+                }
+            }
+            eprintln!("pass --serial to choose one");
+            return ExitCode::FAILURE;
+        }
     };
-    // `find` only matched devices with `info: Some(_)` above.
+    // The filter above only kept devices with `info: Some(_)`.
     let info = device.info.as_ref().expect("matched via info above");
 
     if info.input_report_len == 0 {
@@ -579,10 +664,11 @@ fn run_event(args: EventArgs) -> ExitCode {
     };
 
     println!(
-        "listening on {} ({}:{}) — press Ctrl+C to stop\n",
+        "listening on {} ({}:{}, serial {}) — press Ctrl+C to stop\n",
         device.device_desc.as_deref().unwrap_or("unknown device"),
         hex_dec(args.vid),
         hex_dec(args.pid),
+        device.serial.as_deref().unwrap_or("-"),
     );
 
     loop {

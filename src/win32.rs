@@ -50,6 +50,13 @@ pub type PHIDP_PREPARSED_DATA = *mut c_void;
 /// A HID "usage" value (16-bit numeric ID within a usage page), e.g. `0x02`
 /// for Mouse within the Generic Desktop page. See [`crate::usage`].
 pub type USAGE = u16;
+/// A PnP device node handle, as carried by [`SP_DEVINFO_DATA::DevInst`] and
+/// walked with [`CM_Get_Parent`]. Opaque — only ever passed back into
+/// `CM_*` calls.
+pub type DEVINST = u32;
+/// Return type of the `CM_*` configuration manager calls. [`CR_SUCCESS`] is
+/// the only value meaning the output parameter was filled in.
+pub type CONFIGRET = u32;
 
 /// The sentinel `CreateFileW`/`SetupDiGetClassDevsW` return instead of a real
 /// handle on failure. It is `(HANDLE)-1`, i.e. all bits set — NOT `NULL` — so
@@ -125,6 +132,18 @@ pub const SPDRP_DEVICEDESC: u32 = 0x0000_0000;
 /// means the `HIDP_CAPS` output is valid. Encoded as an NTSTATUS "success"
 /// facility code, not `0`, so it can't be checked with a simple zero test.
 pub const HIDP_STATUS_SUCCESS: NTSTATUS = 0x0011_0000;
+
+// ---------------------------------------------------------------------------
+// CM_* (configuration manager) status codes and limits
+// ---------------------------------------------------------------------------
+
+/// `CR_SUCCESS`: the only [`CONFIGRET`] meaning a `CM_*` call succeeded.
+/// Unlike the Win32 `BOOL` convention, `0` here is success, not failure.
+pub const CR_SUCCESS: CONFIGRET = 0;
+/// `MAX_DEVICE_ID_LEN` from `cfgmgr32.h`: the longest device instance ID the
+/// PnP manager will ever produce, so a fixed buffer of this size makes
+/// [`CM_Get_Device_IDW`] a single-call query with no ask-twice sizing dance.
+pub const MAX_DEVICE_ID_LEN: usize = 200;
 
 // ---------------------------------------------------------------------------
 // Structs
@@ -441,6 +460,43 @@ unsafe extern "system" {
         PropertyBufferSize: u32,
         RequiredSize: *mut u32,
     ) -> BOOL;
+}
+
+// ---------------------------------------------------------------------------
+// cfgmgr32.dll
+//
+// The PnP configuration manager's device-tree walker. SetupAPI describes one
+// device node at a time; these two calls are what let us climb from a HID
+// collection's devnode up to the USB device node that actually carries the
+// hardware's serial number — see [`crate::hid::ancestor_serial`] for why the
+// serial lives two levels up rather than on the HID node itself.
+// ---------------------------------------------------------------------------
+
+#[link(name = "cfgmgr32")]
+unsafe extern "system" {
+    /// Writes the parent of `dnDevInst` into `pdnDevInst`. `ulFlags` must be
+    /// `0`. Fails (with a non-[`CR_SUCCESS`] code) once called on the root of
+    /// the device tree, which is what naturally terminates an upward walk.
+    pub fn CM_Get_Parent(
+        pdnDevInst: *mut DEVINST,
+        dnDevInst: DEVINST,
+        ulFlags: u32,
+    ) -> CONFIGRET;
+
+    /// Writes one devnode's instance ID (e.g.
+    /// `USB\VID_0B05&PID_1ACE\T4MPGDD010NS`) into `Buffer` as a
+    /// NUL-terminated wide string. `ulFlags` must be `0`. Unlike the SetupAPI
+    /// string getters this takes a [`DEVINST`] rather than an
+    /// [`SP_DEVINFO_DATA`], which is what makes it usable on the ancestor
+    /// nodes [`CM_Get_Parent`] hands back — those are never members of our
+    /// device information set, so `SetupDiGetDeviceInstanceIdW` cannot reach
+    /// them.
+    pub fn CM_Get_Device_IDW(
+        dnDevInst: DEVINST,
+        Buffer: *mut u16,
+        BufferLen: u32,
+        ulFlags: u32,
+    ) -> CONFIGRET;
 }
 
 // ---------------------------------------------------------------------------
