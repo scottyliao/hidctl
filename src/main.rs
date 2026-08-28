@@ -30,15 +30,19 @@ const ASUS_VID: u16 = 0x0B05;
 const USAGE: &str = "usage: hidctl <command> [options]\n\
                      \n\
                      available commands:\n\
-                     \x20  list [--vid <id>] [--pid <id>] [-d | --detail]   list HID device interfaces\n\
-                     \x20  event --vid <id> --pid <id>                 stream raw input reports\n\
+                     \x20  list [--vid <id>] [--pid <id>] [--serial <s>] [-d | --detail]\n\
+                     \x20       list HID device interfaces\n\
+                     \x20  event --vid <id> --pid <id> [--serial <s>]\n\
+                     \x20       stream raw input reports\n\
                      \n\
                      ids are decimal unless prefixed with 0x, e.g. 2821 or 0x0B05";
 
 /// Usage message for the `list` subcommand specifically, shown instead of
 /// the top-level [`USAGE`] once we know that's the subcommand in play.
-const LIST_USAGE: &str = "usage: hidctl list [--vid <id>] [--pid <id>] [-d | --detail]\n\
-                          ids are decimal unless prefixed with 0x, e.g. 2821 or 0x0B05";
+const LIST_USAGE: &str = "usage: hidctl list [--vid <id>] [--pid <id>] [--serial <s>] [-d | --detail]\n\
+                          ids are decimal unless prefixed with 0x, e.g. 2821 or 0x0B05\n\
+                          --serial narrows to one physical unit; \
+                          see 'unit serial' in --detail for the values";
 
 /// Usage message for the `event` subcommand specifically, shown instead of
 /// the top-level [`USAGE`] once we know that's the subcommand in play.
@@ -64,6 +68,10 @@ struct Args {
     /// Usable on its own, though a PID is only meaningful per vendor, so it
     /// is normally paired with `vid`.
     pid: Option<u16>,
+    /// Only list interfaces belonging to this physical unit; `None` matches
+    /// any. Useful where VID/PID cannot separate two identical units — see
+    /// [`hid::HidDevice::serial`].
+    serial: Option<String>,
     /// Print the full per-interface dump instead of the grouped summary.
     detail: bool,
 }
@@ -73,7 +81,7 @@ impl Args {
     /// the retain pass below runs and whether the counts are reported as
     /// "matched" rather than "present".
     fn has_filter(&self) -> bool {
-        self.vid.is_some() || self.pid.is_some()
+        self.vid.is_some() || self.pid.is_some() || self.serial.is_some()
     }
 }
 
@@ -126,37 +134,36 @@ fn run_list(args: Args) -> ExitCode {
         // for devices we couldn't open (see hid.rs), so devices Windows
         // locked (e.g. the OS's primary mouse/keyboard collections) still
         // get matched instead of silently vanishing from a filter.
-        devices.retain(|device| match device.vendor_product_id() {
-            Some((vid, pid)) => {
-                args.vid.is_none_or(|want| want == vid) && args.pid.is_none_or(|want| want == pid)
-            }
-            // With no recoverable VID/PID there is no way to tell whether
-            // this interface matches, so an explicit filter drops it.
-            None => false,
+        devices.retain(|device| {
+            let ids_match = match device.vendor_product_id() {
+                Some((vid, pid)) => {
+                    args.vid.is_none_or(|want| want == vid)
+                        && args.pid.is_none_or(|want| want == pid)
+                }
+                // With no recoverable VID/PID there is no way to tell whether
+                // this interface matches, so an explicit ID filter drops it —
+                // but a lone --serial can still be judged below.
+                None => args.vid.is_none() && args.pid.is_none(),
+            };
+            // Same reasoning for the unit serial: one we couldn't recover
+            // cannot satisfy an explicit --serial.
+            let serial_matches = args
+                .serial
+                .as_deref()
+                .is_none_or(|want| device.serial.as_deref() == Some(want));
+            ids_match && serial_matches
         });
     }
 
-    // Sort by (VID, PID, usage page, usage) so every interface belonging to
-    // the same physical device ends up contiguous — which is what lets
-    // `group_by_product` below collapse them by simply walking the list —
-    // then break ties on `path` for full determinism between runs.
-    devices.sort_by(|a, b| {
-        let key = |d: &HidDevice| {
-            d.vendor_product_id().map(|(vid, pid)| {
-                // Devices we couldn't open have no usage page/usage (that comes
-                // from HidP_GetCaps, which needs an open handle) — default to
-                // (0, 0) so they still sort next to their siblings by VID/PID
-                // alone rather than being excluded from the ordering.
-                let usage = d
-                    .info
-                    .as_ref()
-                    .map(|i| (i.usage_page, i.usage))
-                    .unwrap_or_default();
-                (vid, pid, usage)
-            })
-        };
-        key(a).cmp(&key(b)).then_with(|| a.path.cmp(&b.path))
-    });
+    // Sort by (VID, PID, serial, usage page, usage) so every interface
+    // belonging to the same physical unit ends up contiguous — which is what
+    // lets `group_by_product` below collapse them by simply walking the list
+    // — then break ties on `path` for full determinism between runs.
+    //
+    // The serial has to sort *before* the usage: grouping walks runs of equal
+    // (ids, serial), so ordering by usage first would interleave two
+    // identical units' interfaces and split each unit into several groups.
+    devices.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
 
     if devices.is_empty() {
         println!("No matching HID devices present.");
@@ -192,12 +199,16 @@ fn run_list(args: Args) -> ExitCode {
             print_device(index + 1, device);
         }
     } else {
-        for (key, interfaces) in &groups {
+        for ((ids, _serial), interfaces) in &groups {
             // With a vendor filter the VID is the same on every line and just
             // adds noise, so only the PID is shown. Without one — including
             // when only --pid was given, which can still match across
             // vendors — the full VID:PID pair is needed to tell them apart.
-            print_group(*key, interfaces, args.vid.is_some());
+            //
+            // The serial is deliberately not printed: two identical units
+            // now get one entry each, which is what the count is for, and
+            // `--detail` is where per-unit identity belongs.
+            print_group(*ids, interfaces, args.vid.is_some());
         }
     }
 
@@ -214,12 +225,16 @@ fn parse_list_args(mut rest: impl Iterator<Item = String>) -> Result<Args, Strin
     let mut args = Args {
         vid: None,
         pid: None,
+        serial: None,
         detail: false,
     };
 
     while let Some(arg) = rest.next() {
         match arg.as_str() {
             "--detail" | "-d" => args.detail = true,
+            // Serials are opaque vendor strings, not numbers, so unlike the
+            // IDs this is taken verbatim with no parsing.
+            "--serial" => args.serial = Some(take_value(&arg, &mut rest, LIST_USAGE)?),
             // ID given as a separate argument: `--vid 0x0B05`.
             "--vid" => {
                 args.vid = Some(parse_id(
@@ -239,6 +254,9 @@ fn parse_list_args(mut rest: impl Iterator<Item = String>) -> Result<Args, Strin
             }
             other if other.starts_with("--pid=") => {
                 args.pid = Some(parse_id(inline_value(other), "product")?);
+            }
+            other if other.starts_with("--serial=") => {
+                args.serial = Some(inline_value(other).to_string());
             }
             // Convenience alias for the vendor this tool was built against.
             other if other.eq_ignore_ascii_case("asus") => args.vid = Some(ASUS_VID),
@@ -303,7 +321,7 @@ fn take_value(
     usage: &str,
 ) -> Result<String, String> {
     rest.next()
-        .ok_or_else(|| format!("{flag} needs a hex id\n{usage}"))
+        .ok_or_else(|| format!("{flag} needs a value\n{usage}"))
 }
 
 /// Splits the value out of a `--flag=value` style argument.
@@ -337,23 +355,53 @@ fn parse_id(value: &str, kind: &str) -> Result<u16, String> {
     })
 }
 
+/// What identifies one physical device for grouping: its IDs plus its unit
+/// serial, which is what separates two identical units of the same model.
+type GroupKey<'a> = (Option<(u16, u16)>, Option<&'a str>);
+
+/// One grouped physical device: its identity and the interfaces it exposes.
+type Group<'a> = (GroupKey<'a>, Vec<&'a HidDevice>);
+
+/// The grouping identity of one interface. See [`GroupKey`].
+fn group_key(device: &HidDevice) -> GroupKey<'_> {
+    (device.vendor_product_id(), device.serial.as_deref())
+}
+
+/// Orders interfaces so that every group [`group_by_product`] will form is a
+/// contiguous run, and so repeated runs print identically.
+fn sort_key(device: &HidDevice) -> (GroupKey<'_>, (u16, u16), &str) {
+    // Devices we couldn't open have no usage page/usage (that comes from
+    // HidP_GetCaps, which needs an open handle) — default to (0, 0) so they
+    // still sort next to their siblings rather than being excluded from the
+    // ordering.
+    let usage = device
+        .info
+        .as_ref()
+        .map(|i| (i.usage_page, i.usage))
+        .unwrap_or_default();
+    (group_key(device), usage, &device.path)
+}
+
 /// Collapses the flat interface list into one entry per physical device.
 ///
 /// A single physical device typically exposes several HID interfaces (one per
 /// USB `MI_xx` sub-interface, further split per HID top-level `COLxx`
 /// collection), so a raw interface listing badly overstates how much hardware
-/// is attached. Grouping is by `(VID, PID)`, which means two identical units
-/// of the same model would merge into one entry — an acceptable trade for how
-/// much more readable the common case becomes.
+/// is attached.
 ///
-/// Relies on `devices` already being sorted so that equal `(VID, PID)` pairs
-/// are adjacent; it only ever compares against the group it is currently
-/// building. Interfaces with no recoverable VID/PID at all share a single
-/// `None` group.
-fn group_by_product(devices: &[HidDevice]) -> Vec<(Option<(u16, u16)>, Vec<&HidDevice>)> {
-    let mut groups: Vec<(Option<(u16, u16)>, Vec<&HidDevice>)> = Vec::new();
+/// Grouping is by [`GroupKey`] — IDs *and* unit serial — so two identical
+/// units of the same model (two dongles sharing a VID/PID) each get their own
+/// entry. Units whose serial couldn't be recovered fall back to merging by
+/// `(VID, PID)` alone, since without a serial there is nothing left to tell
+/// them apart.
+///
+/// Relies on `devices` already being sorted (see [`sort_key`]) so that equal
+/// keys are adjacent; it only ever compares against the group it is currently
+/// building.
+fn group_by_product(devices: &[HidDevice]) -> Vec<Group<'_>> {
+    let mut groups: Vec<Group<'_>> = Vec::new();
     for device in devices {
-        let key = device.vendor_product_id();
+        let key = group_key(device);
         match groups.last_mut() {
             Some((group_key, interfaces)) if *group_key == key => interfaces.push(device),
             _ => groups.push((key, vec![device])),

@@ -117,11 +117,11 @@ descriptor (`HidInfo::serial_number`, commonly empty); it comes from walking
 up the PnP device tree with `cfgmgr32`'s `CM_Get_Parent`/`CM_Get_Device_IDW`
 to the ancestor USB node, whose instance ID Windows names after the device's
 `iSerialNumber` — see `hid::ancestor_serial`. Being tree-sourced it survives
-a failed open, unlike everything in `HidInfo`. `hidctl event` requires
-`--serial` whenever VID/PID alone match more than one interface, rather than
-streaming from an arbitrary one; note `group_by_product` still merges
-identical units in the *summary* listing (a display trade-off), so their
-serials show only under `--detail`.
+a failed open, unlike everything in `HidInfo`. Both subcommands take `--serial`: `event`
+*requires* it whenever VID/PID alone match more than one interface (rather
+than streaming from an arbitrary one), and `list` accepts it as a filter.
+`group_by_product` keys on `(VID, PID, serial)`, so two identical units get
+one summary entry each; units with no recoverable serial still merge.
 
 `HidDevice::vendor_product_id()` also recovers VID/PID by parsing the
 `HID\VID_xxxx&PID_yyyy&...` instance ID for devices that couldn't be opened
