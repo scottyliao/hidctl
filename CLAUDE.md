@@ -8,8 +8,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 interfaces present on the system, groups them back into physical devices, and
 prints a summary or a full per-interface dump. An `event` subcommand can also
 open one device's vendor-defined report channel and stream its raw input
-reports. It talks to `setupapi.dll`, `hid.dll`, and `kernel32.dll` directly
-via hand-written FFI — there is no `windows`/`winapi` dependency, and
+reports. It talks to `setupapi.dll`, `hid.dll`, `cfgmgr32.dll`, and
+`kernel32.dll` directly via hand-written FFI — there is no `windows`/`winapi`
+dependency, and
 `Cargo.toml` has no dependencies at all. That "no external crates" choice is
 deliberate and should be preserved; if a task seems to call for one, prefer
 hand-rolling the extra bindings in `win32.rs` instead.
@@ -23,7 +24,9 @@ cargo run -- list                # all present HID devices, grouped summary
 cargo run -- list --detail       # full per-interface dump
 cargo run -- list asus           # shorthand for --vid 0x0B05
 cargo run -- list --vid 0x0B05 --pid 0x1A92
+cargo run -- list --serial T4MPGDD010NS        # one physical unit (see 'unit serial' in --detail)
 cargo run -- event --vid 0x0B05 --pid 0x1AB3   # stream raw input reports (Ctrl+C stops)
+cargo run -- event --vid 0x0B05 --pid 0x1ACE --serial T4MPGDD010NS   # pick between identical units
 cargo check               # fast type-check without codegen
 cargo clippy              # lint (if clippy component is installed)
 ```
@@ -43,7 +46,7 @@ behavior the tool already accounts for (see `HidDevice::open_error`), not a
 bug to fix.
 
 Builds only make sense on Windows (MSVC or GNU toolchain); `win32.rs` links
-directly against `setupapi` and `hid` via `#[link(name = "...")]`.
+directly against `setupapi`, `hid`, and `cfgmgr32` via `#[link(name = "...")]`.
 
 ## Git
 
@@ -57,7 +60,8 @@ tracing a change:
 
 - **`win32.rs`** — raw, unsafe FFI declarations only. Every type, constant,
   and `extern "system"` signature is transcribed by hand from the Windows SDK
-  headers (`setupapi.h`, `hidsdi.h`, `hidpi.h`, `hidclass.h`, `winnt.h`). No
+  headers (`setupapi.h`, `hidsdi.h`, `hidpi.h`, `hidclass.h`, `cfgmgr32.h`,
+  `winnt.h`). No
   logic lives here beyond struct constructors that stamp the mandatory
   `cbSize`/`Size` self-description field. If a Win32 struct layout ever stops
   matching a future SDK, this is the file to check first — several structs
@@ -88,16 +92,20 @@ tracing a change:
   Pure data + lookup functions, no I/O. Only covers pages/usages likely to
   appear on a normal PC; anything unlisted still renders as plain hex.
 
-- **`main.rs`** — the CLI: parses arguments (hand-rolled, no arg-parsing
-  crate — matches the project's zero-dependency stance), calls
-  `hid::enumerate`, filters by `--vid`/`--pid` (or the `asus` shorthand for
-  `--vid 0x0B05`), sorts, then collapses the flat interface list into
-  per-physical-device groups via `group_by_product`. The `event` subcommand
-  is dispatched before the listing parser runs and has its own parser with
-  different rules: `--vid`/`--pid` are *mandatory* there (a raw report
-  carries no VID/PID, so the device must be chosen before opening), and the
-  interface to read is the one also matching the hardcoded vendor-defined
-  usage `TARGET_USAGE_PAGE:TARGET_USAGE` (`0xFFC0:0x0001`). The read loop
+- **`main.rs`** — the CLI. `main()` is a pure subcommand dispatcher: the
+  first token picks `list` or `event`, each with its own hand-rolled parser
+  (no arg-parsing crate — matches the zero-dependency stance) and its own
+  usage text on errors. `list` calls `hid::enumerate`, filters by
+  `--vid`/`--pid`/`--serial` (or the `asus` shorthand for `--vid 0x0B05`),
+  sorts, then collapses the flat interface list into per-physical-device
+  groups via `group_by_product`. `event` has different rules:
+  `--vid`/`--pid` are *mandatory* there (a raw report carries no VID/PID, so
+  the device must be chosen before opening), the interface to read is the
+  one also matching the hardcoded vendor-defined usage
+  `TARGET_USAGE_PAGE:TARGET_USAGE` (`0xFFC0:0x0001`), and when more than one
+  interface still matches (two identical dongles) it *refuses to guess* —
+  it lists each candidate's serial and exits, requiring `--serial`, because
+  SetupAPI enumeration order is not stable across replugs. The read loop
   relies on the OS default Ctrl+C handling — no console handler is installed.
 
 ### Key data-flow detail: interfaces vs. devices
@@ -105,23 +113,26 @@ tracing a change:
 A single physical HID device (e.g. a gaming mouse) commonly exposes *several*
 device interfaces — one per USB `MI_xx` sub-interface, further split per HID
 top-level `COLxx` collection. `hid::enumerate()` returns the flat,
-one-per-interface list; `main.rs` sorts it by `(VID, PID, usage page, usage)`
-so same-device interfaces land contiguously, then `group_by_product` collapses
-runs of matching `(VID, PID)` back into one printed entry. Grouping by
-`(VID, PID)` alone means two identical units of the same model merge into a
-single entry — an accepted trade-off for readability.
+one-per-interface list; `main.rs` sorts it by
+`(VID, PID, serial, usage page, usage)` so same-unit interfaces land
+contiguously, then `group_by_product` collapses runs of matching
+`(VID, PID, serial)` back into one printed entry per physical unit. The
+serial must sort *before* the usage — ordering by usage first would
+interleave two identical units' interfaces and split each into several
+groups, since grouping only walks contiguous runs. Units with no recoverable
+serial merge by `(VID, PID)` alone.
 
 `HidDevice::serial` is the physical unit's hardware serial, and is the only
-field that can tell two identical units apart. It is *not* the HID string
-descriptor (`HidInfo::serial_number`, commonly empty); it comes from walking
-up the PnP device tree with `cfgmgr32`'s `CM_Get_Parent`/`CM_Get_Device_IDW`
-to the ancestor USB node, whose instance ID Windows names after the device's
+field that can tell two identical units apart (their product strings and
+VID/PID match exactly). It is *not* the HID string descriptor
+(`HidInfo::serial_number`, commonly empty — shown as "hid serial" in
+`--detail`, vs. "unit serial" for this one); it comes from walking up the
+PnP device tree with `cfgmgr32`'s `CM_Get_Parent`/`CM_Get_Device_IDW` to the
+ancestor USB node, whose instance ID Windows names after the device's
 `iSerialNumber` — see `hid::ancestor_serial`. Being tree-sourced it survives
-a failed open, unlike everything in `HidInfo`. Both subcommands take `--serial`: `event`
-*requires* it whenever VID/PID alone match more than one interface (rather
-than streaming from an arbitrary one), and `list` accepts it as a filter.
-`group_by_product` keys on `(VID, PID, serial)`, so two identical units get
-one summary entry each; units with no recoverable serial still merge.
+a failed open, unlike everything in `HidInfo`. Both subcommands take
+`--serial`: `list` as a filter, `event` as the required disambiguator
+described above.
 
 `HidDevice::vendor_product_id()` also recovers VID/PID by parsing the
 `HID\VID_xxxx&PID_yyyy&...` instance ID for devices that couldn't be opened
